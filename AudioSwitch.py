@@ -99,7 +99,7 @@ if HAVE_WIN32:
 # ============================================================
 
 PREFS_PATH = os.path.join(
-    os.environ.get("APPDATA", os.path.expanduser("~")), "AudioABSwitcher", "prefs.json"
+    os.environ.get("APPDATA", os.path.expanduser("~")), "AudioSwitch", "prefs.json"
 )
 
 
@@ -810,7 +810,7 @@ class SwitcherApp(tk.Tk):
             self.iconbitmap(resource_path("AudioSwitch.ico"))
         except tk.TclError:
             pass
-        self.title(f"Audio A/B Switcher - v{VERSION}")
+        self.title(f"AudioSwitch - v{VERSION}")
         self.resizable(False, False)
 
         self.prefs = load_prefs()
