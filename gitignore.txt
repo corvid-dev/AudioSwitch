@@ -1,0 +1,16 @@
+# Byte-compiled / cache
+__pycache__/
+*.pyc
+
+# PyInstaller build output
+build/
+dist/
+
+# Local user preferences (in case a copy ever ends up in-repo)
+prefs.json
+
+# Editor/OS junk
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
