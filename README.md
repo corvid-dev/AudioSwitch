@@ -1,6 +1,7 @@
 # AudioSwitch
 
 A Windows utility for instantly switching audio output between two input sources (A/B), with a global hotkey toggle and on-screen overlay.
+New to 1.1: Added an optional push to talk system.
 
 ## Requirements
 

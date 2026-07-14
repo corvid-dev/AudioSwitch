@@ -1,21 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-from PyInstaller.utils.hooks import collect_submodules
-
-hiddenimports = (
-    collect_submodules('pynput.keyboard._win32') +
-    collect_submodules('pynput.mouse._win32') +
-    ['comtypes.stream']
-)
 
 a = Analysis(
     ['AudioSwitch.py'],
     pathex=[],
     binaries=[],
-    datas=[
-        ('AudioSwitch.ico', '.'),
-    ],
-    hiddenimports=hiddenimports,
+    datas=[],
+    hiddenimports=['pynput.keyboard._win32', 'pynput.mouse._win32', 'comtypes.stream'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -23,7 +14,6 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
-
 pyz = PYZ(a.pure)
 
 exe = EXE(
@@ -45,5 +35,4 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='AudioSwitch.ico',
 )

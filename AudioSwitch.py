@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
-"""Audio A/B Switcher with a Tkinter interface.
-Routes either of two live inputs to one output device."""
+"""
+Audio A/B Switcher with a Tkinter interface.
+Routes either of two live inputs to one output device.
+Implements a global push to talk (PTT) system.
+"""
 
 # ============================================================
 # 0. Imports
@@ -26,7 +29,7 @@ except ImportError:
     HAVE_PYNPUT = False
 
 try:
-    from pycaw.pycaw import IMMDeviceEnumerator
+    from pycaw.pycaw import IMMDeviceEnumerator, IAudioEndpointVolume
     from comtypes import CLSCTX_ALL, CoInitialize, CoUninitialize, CoCreateInstance, GUID
     HAVE_COM = True
 except ImportError:
@@ -57,7 +60,7 @@ def resource_path(filename):
 # 1. Constants
 # ============================================================
 
-VERSION = "1.0"
+VERSION = "1.1"
 
 DEFAULT_SAMPLE_RATE = 48000
 DEFAULT_CHANNELS = 2
@@ -67,10 +70,15 @@ DEFAULT_BUFFER_BLOCKS = 4
 
 CAPTURING_BG = "#f9a825"
 
+DEFAULT_PTT_DELAY_MS = 250
+MAX_PTT_DELAY_MS = 2000
+PTT_FOLLOW_OUTPUT_LABEL = "Same as Output target"
+
 OVERLAY_POSITIONS = ("Top-left", "Top-right", "Bottom-left", "Bottom-right")
 DEFAULT_OVERLAY_POSITION = "Top-right"
 DEFAULT_OVERLAY_OFFSET = 24
-DEFAULT_OVERLAY_COLORS = {"A": "#00e5ff", "B": "#ff9100"}
+DEFAULT_OVERLAY_LIVE_COLORS = {"A": "#00e5ff", "B": "#ff9100"}
+DEFAULT_OVERLAY_MUTED_COLORS = {"A": "#8a1f1f", "B": "#8a1f1f"}
 
 # Win32 constants for the overlay window (click-through + excluded from
 # screen capture). See the Overlay class for what each one does.
@@ -157,13 +165,27 @@ def explain_stream_error(error_text):
     return f"{error_text}\n\nTry a different host-API copy of this device (type filter)."
 
 
-def _endpoint_friendly_name(ep):
+_friendly_name_cache = {}  # eid -> name, process-lifetime; only touched from the engine thread
+
+
+def _endpoint_friendly_name(ep, eid=None):
+    """Look up an endpoint's friendly name via its property store.
+    Cached by endpoint ID once resolved, since the property-store round
+    trip is the expensive part of every device refresh - not the small
+    in-process loop over an endpoint's properties. Trade-off: if a device
+    is renamed in Windows without its endpoint ID changing, the old name
+    sticks around until the app restarts; that's rare enough to accept."""
+    if eid is not None and eid in _friendly_name_cache:
+        return _friendly_name_cache[eid]
     try:
         store = ep.OpenPropertyStore(0)
         for i in range(store.GetCount()):
             pk = store.GetAt(i)
             if pk.fmtid == _PKEY_NAME and pk.pid == 14:
-                return str(store.GetValue(pk).GetValue())
+                name = str(store.GetValue(pk).GetValue())
+                if eid is not None:
+                    _friendly_name_cache[eid] = name
+                return name
     except Exception:
         pass
     return ""
@@ -189,7 +211,7 @@ def enumerate_com_endpoints(com_enum, dataflow):
             try:
                 ep = col.Item(i)
                 eid = ep.GetId()
-                name = _endpoint_friendly_name(ep)
+                name = _endpoint_friendly_name(ep, eid)
                 if name:
                     result[eid] = name
             except Exception:
@@ -199,11 +221,41 @@ def enumerate_com_endpoints(com_enum, dataflow):
     return result
 
 
+def merge_ptt_endpoints(capture_map, render_map):
+    """Combine the capture and render endpoint maps enumerate_endpoints()
+    already fetches into one PTT device list - this is the union that a
+    dedicated eAll COM traversal would return, but without paying for a
+    third endpoint enumeration on every device refresh. Entries with a
+    shared friendly name get numbered, matching GlobalPTT's own list.
+    NOTE: relies on capture_map/render_map always coming from the same
+    enumerate_endpoints() call (see engine cmd 'enumerate_endpoints') - if
+    that ever changes to fetch them independently, this stops being free."""
+    combined = {}
+    combined.update(capture_map or {})
+    combined.update(render_map or {})  # endpoint IDs never collide across flows
+    result = {}
+    name_counts = {}
+    for eid, name in combined.items():
+        if not name:
+            continue
+        name_counts[name] = name_counts.get(name, 0) + 1
+        result[eid] = f"[{name_counts[name]}] {name}" if name_counts[name] > 1 else name
+    return result
+
+
 def build_device_labels(devices, kind, endpoint_map=None):
     """Build labeled input or output device entries.
     Includes host API details and endpoint IDs when available."""
     endpoint_map = endpoint_map or {}
     hostapis = sd.query_hostapis()
+
+    # Reverse lookup built once, instead of rescanning endpoint_map for
+    # every WASAPI device below. First occurrence wins on a name collision,
+    # matching the previous next(...)-based scan's behavior.
+    name_to_eid = {}
+    for eid, ename in endpoint_map.items():
+        if ename not in name_to_eid:
+            name_to_eid[ename] = eid
 
     def hostapi_name(idx):
         try:
@@ -229,7 +281,7 @@ def build_device_labels(devices, kind, endpoint_map=None):
         hostapi = hostapi_name(d["hostapi"])
         endpoint_id = None
         if "wasapi" in hostapi.lower():
-            endpoint_id = next((eid for eid, ename in endpoint_map.items() if ename == name), None)
+            endpoint_id = name_to_eid.get(name)
         entries.append((i, f"{base} \u2014 {hostapi}", name, hostapi, endpoint_id))
     return entries
 
@@ -329,11 +381,16 @@ def disp(label):
 
 class InputHook:
     """Listen for global keyboard and mouse presses.
-    Posts input events back to the GUI thread."""
+    Posts input events back to the GUI thread.
 
-    def __init__(self, on_press_label, post_to_ui):
+    on_press_label(label) fires once per new press (existing hotkey/capture behavior).
+    on_key_event(label, pressed), if given, fires on every press AND release -
+    used for push-to-talk hold detection."""
+
+    def __init__(self, on_press_label, post_to_ui, on_key_event=None):
         self.on_press_label = on_press_label
         self.post_to_ui = post_to_ui
+        self.on_key_event = on_key_event
         self._pressed = set()
         self._kb_listener = None
         self._ms_listener = None
@@ -359,10 +416,19 @@ class InputHook:
             if label in self._pressed:
                 return
             self._pressed.add(label)
+            self.post_to_ui(self.on_press_label, label)
         else:
+            if label not in self._pressed:
+                return
             self._pressed.discard(label)
-            return
-        self.post_to_ui(self.on_press_label, label)
+        if self.on_key_event:
+            # Called directly on this input thread (not via post_to_ui/Tk's
+            # after(0)) - on_key_event must be thread-safe. This keeps PTT
+            # hold detection off the Tk mainloop entirely, since bouncing
+            # every key/mouse event through Tk (even ones PTT doesn't care
+            # about) adds queuing latency that's very noticeable during
+            # fast keyboard/mouse activity like gaming.
+            self.on_key_event(label, pressed)
 
     def stop(self):
         if self._kb_listener:
@@ -374,11 +440,110 @@ class InputHook:
 
 
 # ============================================================
+# 4b. Push-to-talk hold logic (no tkinter dependency)
+# ============================================================
+
+class PushToTalk:
+    """Hold-to-unmute gate for the output target device.
+    Mutes the output endpoint except while one of its bound keys/buttons is
+    held, same arm/disarm/release-delay behavior as GlobalPTT's per-channel
+    gate, but applied to AudioSwitch's single output target."""
+
+    def __init__(self, engine, post_to_ui):
+        self._engine = engine
+        self._post_to_ui = post_to_ui
+        self.keybinds = []
+        self.delay_ms = DEFAULT_PTT_DELAY_MS
+        self._active = set()
+        self._talking = False
+        self._timer = None
+        self._lock = threading.Lock()
+        self.on_status_change = None
+
+    def set_delay(self, ms):
+        with self._lock:
+            self.delay_ms = max(0, min(MAX_PTT_DELAY_MS, ms))
+
+    def handle_key(self, label, pressed):
+        if label not in self.keybinds:
+            return
+        with self._lock:
+            if pressed:
+                self._active.add(label)
+                should_arm = not self._talking
+            else:
+                self._active.discard(label)
+                should_arm = False
+        if should_arm:
+            self._arm()
+        elif not pressed:
+            self._maybe_disarm()
+
+    def key_removed(self, label):
+        """Force-release a key that was just unbound, in case it's still held."""
+        with self._lock:
+            self._active.discard(label)
+        self._maybe_disarm()
+
+    def _arm(self):
+        with self._lock:
+            if self._timer:
+                self._timer.cancel()
+                self._timer = None
+            self._talking = True
+        self._engine.send("ptt_mute", False)
+        self._notify("LIVE")
+
+    def _maybe_disarm(self):
+        with self._lock:
+            if self._active or not self._talking:
+                return
+            if self._timer:
+                self._timer.cancel()
+                self._timer = None
+            delay = self.delay_ms
+        if delay <= 0:
+            self._silence(None)
+        else:
+            t = threading.Timer(delay / 1000.0, lambda: self._silence(t))
+            t.daemon = True
+            with self._lock:
+                self._timer = t
+            t.start()
+
+    def _silence(self, timer):
+        with self._lock:
+            if timer is not None and timer is not self._timer:
+                return
+            self._timer = None
+            if self._active or not self._talking:
+                return
+            self._talking = False
+        self._engine.send("ptt_mute", True)
+        self._notify("MUTED")
+
+    def _notify(self, text):
+        if self.on_status_change:
+            self._post_to_ui(self.on_status_change, text)
+
+    def cancel(self):
+        """Stop any pending timer and clear held-key state, e.g. on app close."""
+        with self._lock:
+            if self._timer:
+                self._timer.cancel()
+                self._timer = None
+            self._talking = False
+            self._active.clear()
+
+
+# ============================================================
 # 5. Screen overlay (Windows only; degrades to a plain window elsewhere)
 # ============================================================
 
 class Overlay:
-    """Show a colored square for the active source.
+    """Show a colored square for the active source. Each of A and B has its
+    own muted color and live color; while push-to-talk is enabled the square
+    picks between the active slot's muted/live color based on gate state.
     Uses Windows click-through and capture-exclusion features when available."""
 
     _SQUARE_SIZE = 12
@@ -390,8 +555,13 @@ class Overlay:
         self._position = DEFAULT_OVERLAY_POSITION
         self._offset_x = DEFAULT_OVERLAY_OFFSET
         self._offset_y = DEFAULT_OVERLAY_OFFSET
-        self._colors = dict(DEFAULT_OVERLAY_COLORS)
+        self._colors = {
+            "A": {"muted": DEFAULT_OVERLAY_MUTED_COLORS["A"], "live": DEFAULT_OVERLAY_LIVE_COLORS["A"]},
+            "B": {"muted": DEFAULT_OVERLAY_MUTED_COLORS["B"], "live": DEFAULT_OVERLAY_LIVE_COLORS["B"]},
+        }
         self._slot = "A"
+        self._ptt_mode = False
+        self._ptt_muted = True
 
     def set_position(self, position):
         self._position = position if position in OVERLAY_POSITIONS else DEFAULT_OVERLAY_POSITION
@@ -405,13 +575,33 @@ class Overlay:
 
     def set_slot(self, slot):
         self._slot = slot
-        if self._square is not None:
-            self._square.config(bg=self._colors.get(slot, DEFAULT_OVERLAY_COLORS["A"]))
+        self._refresh_color()
 
-    def set_color(self, slot, color):
-        self._colors[slot] = color
-        if self._square is not None and self._slot == slot:
-            self._square.config(bg=color)
+    def set_color(self, slot, mode, color):
+        """mode is 'muted' or 'live'."""
+        self._colors.setdefault(slot, {})[mode] = color
+        self._refresh_color()
+
+    def set_ptt_mode(self, enabled):
+        """While enabled, the muted color is used instead of the live color
+        whenever the gate is currently muted."""
+        self._ptt_mode = enabled
+        self._refresh_color()
+
+    def set_ptt_muted(self, muted):
+        self._ptt_muted = muted
+        self._refresh_color()
+
+    def _current_color(self):
+        effective_muted = self._ptt_mode and self._ptt_muted
+        mode = "muted" if effective_muted else "live"
+        default = DEFAULT_OVERLAY_MUTED_COLORS if mode == "muted" else DEFAULT_OVERLAY_LIVE_COLORS
+        slot_colors = self._colors.get(self._slot, {})
+        return slot_colors.get(mode, default.get(self._slot, "#ffffff"))
+
+    def _refresh_color(self):
+        if self._square is not None:
+            self._square.config(bg=self._current_color())
 
     def show(self):
         if self._win is not None:
@@ -425,7 +615,7 @@ class Overlay:
         except tk.TclError:
             pass
         self._square = tk.Frame(
-            win, bg=self._colors.get(self._slot, DEFAULT_OVERLAY_COLORS["A"]),
+            win, bg=self._current_color(),
             width=self._SQUARE_SIZE, height=self._SQUARE_SIZE,
         )
         self._square.pack_propagate(False)
@@ -536,8 +726,16 @@ class AudioSwitcher:
         self.on_switch = on_switch
 
         self.active_slot = initial_slot if initial_slot in ("A", "B") else "A"
-        self._take_latest = False
-        self.lock = threading.Lock()
+        # (slot, generation) - the ONLY thing the real-time output callback
+        # reads to decide what to play. Written wholesale (one atomic
+        # reference swap) by set_active_slot()/toggle(), which both run on
+        # the engine thread - never inside the callback. This intentionally
+        # avoids a lock in the audio callback: acquiring a lock there could
+        # block the real-time thread on contention with the engine thread
+        # and cause audible dropouts. _drained_generation belongs solely to
+        # the callback thread - nothing else touches it.
+        self._switch_state = (self.active_slot, 0)
+        self._drained_generation = 0
 
         self.buffers = {"A": None, "B": None}
         self.input_streams = {"A": None, "B": None}
@@ -550,6 +748,7 @@ class AudioSwitcher:
         self._mix_scratch = None
         self._mono_scratch = None
         self._pad_scratch = None
+        self._converters = {"A": None, "B": None}  # per-slot channel-conversion function, precomputed on open/swap
 
     @staticmethod
     def _resolve_device(device_index, requested, is_input):
@@ -560,23 +759,35 @@ class AudioSwitcher:
             raise ValueError(f"'{info['name']}' has no {'input' if is_input else 'output'} channels")
         return max(1, min(requested, device_max)), info["name"]
 
-    def _adapt_channels(self, block, target):
-        src = block.shape[1]
+    def _build_channel_converter(self, src, target):
+        """Return a channel-conversion function specialized for one (src,
+        target) pair, computed once when a slot's stream opens or swaps -
+        not re-decided (equal/upmix/downmix branch) on every audio block."""
         if src == target:
-            return block
-        frames = block.shape[0]
-        out = self._mix_scratch[:frames]
+            return lambda block: block
         if src < target:
             reps, rem = divmod(target, src)
-            for i in range(reps):
-                out[:, i * src:(i + 1) * src] = block
-            if rem:
-                out[:, reps * src:reps * src + rem] = block[:, :rem]
-        else:
+
+            def upmix(block):
+                frames = block.shape[0]
+                out = self._mix_scratch[:frames]
+                for i in range(reps):
+                    out[:, i * src:(i + 1) * src] = block
+                if rem:
+                    out[:, reps * src:reps * src + rem] = block[:, :rem]
+                return out
+
+            return upmix
+
+        def downmix(block):
+            frames = block.shape[0]
             mono = self._mono_scratch[:frames]
             block.mean(axis=1, out=mono)
+            out = self._mix_scratch[:frames]
             out[:] = mono[:, None]
-        return out
+            return out
+
+        return downmix
 
     @staticmethod
     def _make_ring_write_callback(ring):
@@ -599,28 +810,29 @@ class AudioSwitcher:
             callback=self._make_ring_write_callback(ring),
         )
         stream.start()
-        return stream, name, ring
+        return stream, name, ring, actual_channels
 
     def _open_slot_stream(self, slot):
         """Open and store one source stream during startup."""
-        stream, name, ring = self._create_slot_stream(self.slot_devices[slot])
+        stream, name, ring, actual_channels = self._create_slot_stream(self.slot_devices[slot])
         self.input_streams[slot] = stream
         self.slot_names[slot] = name
         self.buffers[slot] = ring
+        self._converters[slot] = self._build_channel_converter(actual_channels, self.output_channels)
 
     def _output_callback(self, outdata, frames, _time_info, _status):
-        with self.lock:
-            active = self.active_slot
-            take_latest = self._take_latest
-            self._take_latest = False
+        active, generation = self._switch_state  # single atomic reference read, no lock
         ring = self.buffers.get(active)
-        if take_latest and ring is not None:
-            ring.drain_to_latest()
+        if generation != self._drained_generation:
+            self._drained_generation = generation
+            if ring is not None:
+                ring.drain_to_latest()
         block = ring.read_latest() if ring is not None else None
         if block is None:
             outdata[:] = 0
             return
-        block = self._adapt_channels(block, self.output_channels)
+        converter = self._converters.get(active)
+        block = converter(block) if converter is not None else block
         if block.shape[0] != frames:
             if self._pad_scratch is None:
                 self._pad_scratch = np.zeros((self.blocksize, self.output_channels), dtype=DTYPE)
@@ -634,29 +846,28 @@ class AudioSwitcher:
 
     def set_active_slot(self, slot):
         """Set the active source and notify the GUI."""
-        with self.lock:
-            self.active_slot = slot
-            self._take_latest = True
+        self.active_slot = slot
+        self._switch_state = (slot, self._switch_state[1] + 1)
         if self.on_switch:
             self.on_switch(slot)
 
     def toggle(self):
-        with self.lock:
-            self.active_slot = "B" if self.active_slot == "A" else "A"
-            self._take_latest = True
-            slot = self.active_slot
+        slot = "B" if self._switch_state[0] == "A" else "A"
+        self.active_slot = slot
+        self._switch_state = (slot, self._switch_state[1] + 1)
         if self.on_switch:
             self.on_switch(slot)
 
     def swap_device(self, slot, new_device_index):
         """Replace one source device while preserving the old stream on failure."""
-        stream, name, ring = self._create_slot_stream(new_device_index)
+        stream, name, ring, actual_channels = self._create_slot_stream(new_device_index)
 
         old_stream = self.input_streams.get(slot)
         self.input_streams[slot] = stream
         self.slot_names[slot] = name
         self.buffers[slot] = ring
         self.slot_devices[slot] = new_device_index
+        self._converters[slot] = self._build_channel_converter(actual_channels, self.output_channels)
 
         if old_stream is not None:
             try:
@@ -707,6 +918,60 @@ class AudioSwitcher:
             self.output_stream = None
 
 
+class EndpointGate:
+    """Mute/unmute a Windows audio endpoint via its EndpointVolume interface.
+    Same technique GlobalPTT uses to gate a mic; here it's pointed at the
+    output target endpoint instead. Must be used from the COM thread."""
+
+    def __init__(self):
+        self._vol = None
+        self._orig_mute = False
+        self._orig_vol = 1.0
+        self._use_vol = False
+
+    def activate(self, enum, ep_id):
+        self.deactivate()
+        if enum is None or not ep_id:
+            return False
+        try:
+            vol = enum.GetDevice(ep_id).Activate(
+                IAudioEndpointVolume._iid_, CLSCTX_ALL, None
+            ).QueryInterface(IAudioEndpointVolume)
+            self._orig_mute = bool(vol.GetMute())
+            self._orig_vol = vol.GetMasterVolumeLevelScalar()
+            vol.SetMute(1, None)
+            self._use_vol = not bool(vol.GetMute())
+            vol.SetMute(0, None)
+            self._vol = vol
+            return True
+        except Exception:
+            self.deactivate()
+            return False
+
+    def set_mute(self, muted):
+        if not self._vol:
+            return
+        try:
+            if self._use_vol:
+                self._vol.SetMasterVolumeLevelScalar(0.0 if muted else self._orig_vol, None)
+            else:
+                self._vol.SetMute(int(muted), None)
+        except Exception:
+            pass
+
+    def deactivate(self):
+        if not self._vol:
+            return
+        try:
+            if self._use_vol:
+                self._vol.SetMasterVolumeLevelScalar(self._orig_vol, None)
+            else:
+                self._vol.SetMute(int(self._orig_mute), None)
+        except Exception:
+            pass
+        self._vol = None
+
+
 class AudioEngine:
     """Run audio and COM work on a background thread.
     Uses a queue for commands and GUI callbacks."""
@@ -714,7 +979,7 @@ class AudioEngine:
     def __init__(self, on_switch, post_to_ui):
         self.post_to_ui = post_to_ui
         self._on_switch = on_switch
-        self._q = queue.Queue()
+        self._q = queue.SimpleQueue()
         self._switcher = None
         self._thread = None
 
@@ -740,6 +1005,7 @@ class AudioEngine:
 
     def _run(self):
         CoInitialize()
+        ptt_gate = EndpointGate()
         try:
             com_enum = create_com_enumerator()
             while True:
@@ -749,6 +1015,7 @@ class AudioEngine:
                     if self._switcher:
                         self._switcher.stop()
                         self._switcher = None
+                    ptt_gate.deactivate()
                     break
 
                 try:
@@ -783,6 +1050,17 @@ class AudioEngine:
                             "output": enumerate_com_endpoints(com_enum, EDATAFLOW_RENDER),
                         }
                         self._reply(cb, True, result)
+                    elif cmd == "ptt_attach":
+                        ok = ptt_gate.activate(com_enum, arg)
+                        if ok:
+                            ptt_gate.set_mute(True)  # PTT starts muted until a key is held
+                        self._reply(cb, ok)
+                    elif cmd == "ptt_detach":
+                        ptt_gate.deactivate()
+                        self._reply(cb, True)
+                    elif cmd == "ptt_mute":
+                        ptt_gate.set_mute(bool(arg))
+                        self._reply(cb, True)
                 except Exception as e:
                     self._reply(cb, False, str(e))
         finally:
@@ -819,6 +1097,7 @@ class SwitcherApp(tk.Tk):
         self._save_after_id = None  # debounce timer for _schedule_save()
         self.toggle_hotkey = self.prefs.get("toggle_hotkey")
         self._active_slot = self.prefs.get("active_slot") if self.prefs.get("active_slot") in ("A", "B") else "A"
+        self._auto_start_pending = bool(self.prefs.get("was_running", False))
 
         self._current_device_index = {"A": None, "B": None}
         self._current_output_index = None
@@ -830,9 +1109,24 @@ class SwitcherApp(tk.Tk):
         self.engine = AudioEngine(self._handle_slot_switch, post_to_ui)
         self.engine.start()
 
+        self.ptt = PushToTalk(self.engine, post_to_ui)
+        self.ptt.keybinds = list(self.prefs.get("ptt_keybinds", []))
+        self.ptt.set_delay(self.prefs.get("ptt_delay_ms", DEFAULT_PTT_DELAY_MS))
+        self.ptt.on_status_change = self._on_ptt_status
+        self.ptt_capturing = False
+        self._ptt_attached_ep_id = None
+        self._ptt_enabled_flag = bool(self.prefs.get("ptt_enabled", False))  # thread-safe mirror, see _on_ptt_key_event
+        # PTT target: an endpoint ID (stable, covers render+capture - see
+        # merge_ptt_endpoints), or None to follow Output target. Endpoint
+        # IDs are already unique/stable so no fuzzy name matching is needed
+        # the way source_a/source_b/output require.
+        self._current_ptt_ep_id = self.prefs.get("ptt_target_ep_id")
+        self._ptt_endpoints = {}  # eid -> display label, covers render+capture
+        self.ptt_device_map = {}
+
         self.hotkey_enabled_var = tk.BooleanVar(value=self.prefs.get("hotkey_enabled", True))
-        self.hook = InputHook(self._on_input_label, post_to_ui)
-        if HAVE_PYNPUT and self.hotkey_enabled_var.get():
+        self.hook = InputHook(self._on_input_label, post_to_ui, on_key_event=self._on_ptt_key_event)
+        if HAVE_PYNPUT and (self.hotkey_enabled_var.get() or self.prefs.get("ptt_enabled", False)):
             self.hook.start()
 
         self.overlay = Overlay(self)
@@ -841,10 +1135,19 @@ class SwitcherApp(tk.Tk):
         overlay_offset_x = self.prefs.get("overlay_offset_x", DEFAULT_OVERLAY_OFFSET)
         overlay_offset_y = self.prefs.get("overlay_offset_y", DEFAULT_OVERLAY_OFFSET)
         self.overlay.set_offset(overlay_offset_x, overlay_offset_y)
-        overlay_color_a = self.prefs.get("overlay_color_a", DEFAULT_OVERLAY_COLORS["A"])
-        overlay_color_b = self.prefs.get("overlay_color_b", DEFAULT_OVERLAY_COLORS["B"])
-        self.overlay.set_color("A", overlay_color_a)
-        self.overlay.set_color("B", overlay_color_b)
+        overlay_color_a_muted = self.prefs.get("overlay_color_a_muted", DEFAULT_OVERLAY_MUTED_COLORS["A"])
+        overlay_color_a_live = self.prefs.get(
+            "overlay_color_a_live", self.prefs.get("overlay_color_a", DEFAULT_OVERLAY_LIVE_COLORS["A"])
+        )
+        overlay_color_b_muted = self.prefs.get("overlay_color_b_muted", DEFAULT_OVERLAY_MUTED_COLORS["B"])
+        overlay_color_b_live = self.prefs.get(
+            "overlay_color_b_live", self.prefs.get("overlay_color_b", DEFAULT_OVERLAY_LIVE_COLORS["B"])
+        )
+        self.overlay.set_color("A", "muted", overlay_color_a_muted)
+        self.overlay.set_color("A", "live", overlay_color_a_live)
+        self.overlay.set_color("B", "muted", overlay_color_b_muted)
+        self.overlay.set_color("B", "live", overlay_color_b_live)
+        self.overlay.set_ptt_mode(self.prefs.get("ptt_enabled", False))
         self.overlay.set_slot(self._active_slot)
         self.overlay_enabled_var = tk.BooleanVar(value=self.prefs.get("overlay_enabled", False))
         self.overlay_position_var = tk.StringVar(value=overlay_position)
@@ -852,10 +1155,13 @@ class SwitcherApp(tk.Tk):
         self.overlay_offset_y_var = tk.IntVar(value=overlay_offset_y)
         self.overlay_offset_x_var.trace_add("write", lambda *_: self._on_overlay_offset_changed())
         self.overlay_offset_y_var.trace_add("write", lambda *_: self._on_overlay_offset_changed())
-        self.overlay_color_a_var = tk.StringVar(value=overlay_color_a)
-        self.overlay_color_b_var = tk.StringVar(value=overlay_color_b)
+        self.overlay_color_a_muted_var = tk.StringVar(value=overlay_color_a_muted)
+        self.overlay_color_a_live_var = tk.StringVar(value=overlay_color_a_live)
+        self.overlay_color_b_muted_var = tk.StringVar(value=overlay_color_b_muted)
+        self.overlay_color_b_live_var = tk.StringVar(value=overlay_color_b_live)
 
         self._build_ui()
+        self._sync_input_hook()
         self._refresh_devices()
         self._fit()
 
@@ -898,7 +1204,7 @@ class SwitcherApp(tk.Tk):
         )
         self.hotkey_button.pack(side="right")
         self.hotkey_enabled_check = ttk.Checkbutton(
-            hk_frame, text="Enable hotkey", variable=self.hotkey_enabled_var,
+            hk_frame, text="Enable switch hotkey", variable=self.hotkey_enabled_var,
             command=self._on_hotkey_enabled_toggle,
         )
         self.hotkey_enabled_check.pack(side="right", padx=(0, 8))
@@ -930,18 +1236,33 @@ class SwitcherApp(tk.Tk):
 
         left_row2 = ttk.Frame(left_col)
         left_row2.pack(fill="x")
-        ttk.Label(left_row2, text="A:").pack(side="left")
-        self.overlay_color_a_button = tk.Button(
-            left_row2, text="Color...", command=lambda: self._on_overlay_color_clicked("A"),
-            bg=self.overlay_color_a_var.get(),
+        ttk.Label(left_row2, text="Muted A:", width=8, anchor="w").pack(side="left")
+        self.overlay_color_a_muted_button = tk.Button(
+            left_row2, text="Color...", command=lambda: self._on_overlay_color_clicked("A", "muted"),
+            bg=self.overlay_color_a_muted_var.get(),
         )
-        self.overlay_color_a_button.pack(side="left", padx=(2, 12))
-        ttk.Label(left_row2, text="B:").pack(side="left")
-        self.overlay_color_b_button = tk.Button(
-            left_row2, text="Color...", command=lambda: self._on_overlay_color_clicked("B"),
-            bg=self.overlay_color_b_var.get(),
+        self.overlay_color_a_muted_button.pack(side="left", padx=(2, 12))
+        ttk.Label(left_row2, text="Muted B:", width=8, anchor="w").pack(side="left")
+        self.overlay_color_b_muted_button = tk.Button(
+            left_row2, text="Color...", command=lambda: self._on_overlay_color_clicked("B", "muted"),
+            bg=self.overlay_color_b_muted_var.get(),
         )
-        self.overlay_color_b_button.pack(side="left", padx=(2, 0))
+        self.overlay_color_b_muted_button.pack(side="left", padx=(2, 0))
+
+        left_row3 = ttk.Frame(left_col)
+        left_row3.pack(fill="x", pady=(4, 0))
+        ttk.Label(left_row3, text="Live A:", width=8, anchor="w").pack(side="left")
+        self.overlay_color_a_live_button = tk.Button(
+            left_row3, text="Color...", command=lambda: self._on_overlay_color_clicked("A", "live"),
+            bg=self.overlay_color_a_live_var.get(),
+        )
+        self.overlay_color_a_live_button.pack(side="left", padx=(2, 12))
+        ttk.Label(left_row3, text="Live B:", width=8, anchor="w").pack(side="left")
+        self.overlay_color_b_live_button = tk.Button(
+            left_row3, text="Color...", command=lambda: self._on_overlay_color_clicked("B", "live"),
+            bg=self.overlay_color_b_live_var.get(),
+        )
+        self.overlay_color_b_live_button.pack(side="left", padx=(2, 0))
 
         offset_col = ttk.Frame(overlay_frame)
         offset_col.pack(side="left", padx=(20, 8), pady=8)
@@ -998,9 +1319,65 @@ class SwitcherApp(tk.Tk):
             anchor="w", padx=10, pady=(0, 6)
         )
 
+        ptt_frame = ttk.LabelFrame(self, text="Push-to-Talk")
+        ptt_frame.pack(fill="x", padx=10, pady=(0, 10))
+
+        ptt_top = ttk.Frame(ptt_frame)
+        ptt_top.pack(fill="x", padx=8, pady=(8, 4))
+        self.ptt_enabled_var = tk.BooleanVar(value=self.prefs.get("ptt_enabled", False))
+        self.ptt_enabled_check = ttk.Checkbutton(
+            ptt_top, text="Enable push-to-talk", variable=self.ptt_enabled_var,
+            command=self._on_ptt_enabled_toggle,
+        )
+        self.ptt_enabled_check.pack(side="left")
+        self.ptt_status_var = tk.StringVar(value="INACTIVE")
+        ttk.Label(ptt_top, textvariable=self.ptt_status_var, foreground="#555").pack(side="right")
+
+        ptt_device_label = ttk.Label(ptt_frame, text="Target device:")
+        ptt_device_label.pack(anchor="w", padx=8, pady=(0, 2))
+        ptt_filter_row = ttk.Frame(ptt_frame)
+        ptt_filter_row.pack(fill="x", padx=8, pady=(0, 4))
+        ptt_search_var = tk.StringVar(value=self.prefs.get("ptt_search", ""))
+        ptt_search_var.trace_add("write", lambda *_: self._on_ptt_search_changed())
+        ttk.Entry(ptt_filter_row, textvariable=ptt_search_var).pack(side="left", fill="x", expand=True)
+
+        self.ptt_device_combo = ttk.Combobox(ptt_frame, state="readonly", width=48)
+        self.ptt_device_combo.pack(fill="x", padx=8, pady=(0, 4))
+        self.ptt_device_combo.bind("<<ComboboxSelected>>", lambda e: self._on_ptt_device_selected())
+
+        self.ptt_ctrl = {"search_var": ptt_search_var, "map": {}}
+
+        ptt_keys_row = ttk.Frame(ptt_frame)
+        ptt_keys_row.pack(fill="x", padx=8, pady=(0, 4))
+        ttk.Label(ptt_keys_row, text="Keys:").pack(side="left")
+        self.ptt_add_button = tk.Button(
+            ptt_keys_row, text="+ Add Key", command=self._begin_ptt_capture
+        )
+        self.ptt_add_button.pack(side="left", padx=(6, 0))
+        self.ptt_binds_frame = ttk.Frame(ptt_frame)
+        self.ptt_binds_frame.pack(fill="x", padx=8, pady=(0, 4))
+
+        ptt_delay_row = ttk.Frame(ptt_frame)
+        ptt_delay_row.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Label(ptt_delay_row, text="Release delay:").pack(side="left")
+        self.ptt_delay_var = tk.IntVar(value=self.ptt.delay_ms)
+        self.ptt_delay_label_var = tk.StringVar(value=f"{self.ptt.delay_ms} ms")
+        ttk.Scale(
+            ptt_delay_row, from_=0, to=MAX_PTT_DELAY_MS, orient="horizontal",
+            variable=self.ptt_delay_var, command=self._on_ptt_delay_changed,
+        ).pack(side="left", fill="x", expand=True, padx=(6, 8))
+        ttk.Label(ptt_delay_row, textvariable=self.ptt_delay_label_var, width=7).pack(side="left")
+
+        if not HAVE_PYNPUT or not HAVE_COM:
+            self.ptt_enabled_check.config(state="disabled")
+            self.ptt_add_button.config(state="disabled")
+            self.ptt_device_combo.config(state="disabled")
+
+        self._rebuild_ptt_binds()
+
         if not HAVE_PYNPUT:
             ttk.Label(
-                self, text="Note: 'pynput' package not installed - hotkey disabled.",
+                self, text="Note: 'pynput' package not installed - hotkey and push-to-talk disabled.",
                 foreground="#a33",
             ).pack(anchor="w", padx=10)
 
@@ -1008,7 +1385,7 @@ class SwitcherApp(tk.Tk):
             ttk.Label(
                 self,
                 text="Note: 'pycaw'/'comtypes' not installed - device matching falls back "
-                     "to name/type text instead of the real device ID.",
+                     "to name/type text instead of the real device ID, and push-to-talk is disabled.",
                 foreground="#a33",
             ).pack(anchor="w", padx=10)
 
@@ -1068,6 +1445,7 @@ class SwitcherApp(tk.Tk):
         devices = sd.query_devices()
         self._input_devices = build_device_labels(devices, "input", endpoint_maps.get("input"))
         self._output_devices = build_device_labels(devices, "output", endpoint_maps.get("output"))
+        self._ptt_endpoints = merge_ptt_endpoints(endpoint_maps.get("input"), endpoint_maps.get("output"))
 
         self._current_device_index["A"] = resolve_selection(
             self._current_device_index.get("A"), self.prefs.get("source_a"), self._input_devices, 0
@@ -1088,6 +1466,12 @@ class SwitcherApp(tk.Tk):
         self._apply_filter("A")
         self._apply_filter("B")
         self._apply_filter("output")
+        self._apply_ptt_filter()
+        self._ptt_sync()
+
+        if self._auto_start_pending:
+            self._auto_start_pending = False
+            self._start()
 
     @staticmethod
     def _populate_type_filter(combo, hostapi_list):
@@ -1134,7 +1518,7 @@ class SwitcherApp(tk.Tk):
         if dev_index is None:
             return
         self._current_device_index[slot] = dev_index
-        self._save()
+        self._schedule_save()
 
         if self.running:
             self.status_var.set(f"Switching Source {slot}...")
@@ -1151,7 +1535,8 @@ class SwitcherApp(tk.Tk):
         if dev_index is None:
             return
         self._current_output_index = dev_index
-        self._save()
+        self._ptt_sync()
+        self._schedule_save()
 
     def _start(self):
         index_a = self._current_device_index.get("A")
@@ -1200,7 +1585,7 @@ class SwitcherApp(tk.Tk):
             self.output_combo.config(state="disabled")
             if self.overlay_enabled_var.get():
                 self.overlay.show()
-            self._save()
+            self._schedule_save()
             self._refresh_status()
 
         self.engine.send(
@@ -1221,11 +1606,14 @@ class SwitcherApp(tk.Tk):
             self.overlay.hide()
             for s, pane in (("A", self.pane_a), ("B", self.pane_b)):
                 pane["frame"].config(text=f"Source {s}")
+            self._schedule_save()
 
         self.engine.send("stop", cb=done)
 
     def _on_close(self):
         self.hook.stop()
+        self.ptt.cancel()
+        self.engine.send("ptt_detach")
         self.overlay.hide()
         self.engine.close()
         if self._save_after_id is not None:
@@ -1256,30 +1644,180 @@ class SwitcherApp(tk.Tk):
             return
         self.capturing = True
         self.hotkey_button.config(text="Press a key...", bg=CAPTURING_BG, state="disabled")
+        self._sync_input_hook()
 
     def _on_hotkey_enabled_toggle(self):
         enabled = self.hotkey_enabled_var.get()
         if enabled:
-            self.hook.start()
             self.hotkey_button.config(state="normal")
         else:
             if self.capturing:
                 self.capturing = False
                 self.hotkey_button.config(text="Set Toggle Hotkey...", bg="SystemButtonFace")
-            self.hook.stop()
             self.hotkey_button.config(state="disabled")
-        self._save()
+        self._sync_input_hook()
+        self._schedule_save()
+
+    def _sync_input_hook(self):
+        """Start or stop the shared global input hook based on whether
+        anything currently needs it: the switch hotkey, PTT, or an
+        in-progress key capture for either. Kept decoupled from the
+        individual checkboxes so turning off the switch hotkey doesn't
+        also take PTT down with it, and vice versa."""
+        needed = HAVE_PYNPUT and (
+            self.hotkey_enabled_var.get() or self.ptt_enabled_var.get()
+            or self.capturing or self.ptt_capturing
+        )
+        if needed:
+            self.hook.start()
+        else:
+            self.hook.stop()
+
+    def _begin_ptt_capture(self):
+        if not HAVE_PYNPUT or self.ptt_capturing:
+            return
+        self.ptt_capturing = True
+        self.ptt_add_button.config(text="Press a key...", bg=CAPTURING_BG, state="disabled")
+        self._sync_input_hook()
+
+    def _rebuild_ptt_binds(self):
+        for child in self.ptt_binds_frame.winfo_children():
+            child.destroy()
+        if not self.ptt.keybinds:
+            ttk.Label(self.ptt_binds_frame, text="none", foreground="#888").pack(side="left")
+            return
+        for label in self.ptt.keybinds:
+            chip = ttk.Frame(self.ptt_binds_frame)
+            chip.pack(side="left", padx=(0, 6), pady=2)
+            ttk.Label(chip, text=disp(label)).pack(side="left", padx=(4, 0))
+            tk.Button(
+                chip, text="\u2715", command=lambda l=label: self._remove_ptt_bind(l),
+                relief="flat", bd=0, padx=2,
+            ).pack(side="left")
+
+    def _remove_ptt_bind(self, label):
+        if label in self.ptt.keybinds:
+            self.ptt.keybinds.remove(label)
+            self.ptt.key_removed(label)
+            self._rebuild_ptt_binds()
+            self._schedule_save()
+
+    def _apply_ptt_filter(self):
+        """Filter the PTT device list (every render+capture endpoint) by
+        search text. 'Same as Output target' always stays available at the
+        top regardless of the filter, and the current selection is
+        preserved even if it gets filtered out of view."""
+        q = self.ptt_ctrl["search_var"].get().strip().lower()
+        filtered_pairs = sorted(
+            ((eid, label) for eid, label in self._ptt_endpoints.items() if not q or q in label.lower()),
+            key=lambda pair: pair[1].lower(),
+        )
+        mapping = {PTT_FOLLOW_OUTPUT_LABEL: None}
+        values = [PTT_FOLLOW_OUTPUT_LABEL]
+        for eid, label in filtered_pairs:
+            mapping[label] = eid
+            values.append(label)
+
+        cur_label = None
+        if self._current_ptt_ep_id is not None:
+            cur_label = self._ptt_endpoints.get(self._current_ptt_ep_id)
+            if cur_label and cur_label not in mapping:
+                mapping[cur_label] = self._current_ptt_ep_id
+                values.append(cur_label)
+            elif not cur_label and self._ptt_endpoints:
+                # Only clear once we've actually seen a real endpoint list -
+                # an empty dict just means enumeration hasn't completed yet.
+                self._current_ptt_ep_id = None
+
+        self.ptt_device_map = mapping
+        self.ptt_device_combo["values"] = values
+        self.ptt_device_combo.set(cur_label if cur_label else PTT_FOLLOW_OUTPUT_LABEL)
+
+    def _on_ptt_search_changed(self):
+        self._apply_ptt_filter()
+        self._schedule_save()
+
+    def _on_ptt_device_selected(self):
+        self._current_ptt_ep_id = self.ptt_device_map.get(self.ptt_device_combo.get())
+        self._ptt_attached_ep_id = None  # force a re-attach against the new target
+        self._ptt_sync()
+        self._schedule_save()
+
+    def _on_ptt_delay_changed(self, value):
+        try:
+            ms = int(float(value))
+        except ValueError:
+            return
+        self.ptt_delay_label_var.set(f"{ms} ms")
+        self.ptt.set_delay(ms)
+        self._schedule_save()
+
+    def _on_ptt_enabled_toggle(self):
+        self._ptt_enabled_flag = self.ptt_enabled_var.get()
+        if not self._ptt_enabled_flag:
+            self.ptt.cancel()
+        self._sync_input_hook()
+        self._ptt_sync()
+        self._schedule_save()
+
+    def _on_ptt_status(self, text):
+        if self.ptt_enabled_var.get():
+            self.ptt_status_var.set(text)
+            self.overlay.set_ptt_muted(text != "LIVE")
+
+    def _on_ptt_key_event(self, label, pressed):
+        # May be called directly from the pynput listener thread (see
+        # InputHook._dispatch), so this must not touch Tk widgets/variables -
+        # hence the plain-bool flag instead of self.ptt_enabled_var.get().
+        if self._ptt_enabled_flag:
+            self.ptt.handle_key(label, pressed)
+
+    def _ptt_sync(self):
+        """Attach or detach the PTT gate to match the current target device
+        (an explicit endpoint override, or the Output target by default)
+        and the enabled state. Called whenever any of those change."""
+        if not self.ptt_enabled_var.get() or not HAVE_PYNPUT or not HAVE_COM:
+            self.overlay.set_ptt_mode(False)
+            if self._ptt_attached_ep_id is not None:
+                self.engine.send("ptt_detach")
+                self._ptt_attached_ep_id = None
+            self.ptt_status_var.set("INACTIVE")
+            return
+        self.overlay.set_ptt_mode(True)
+        if self._current_ptt_ep_id is not None:
+            ep_id = self._current_ptt_ep_id
+        else:
+            entry = entry_for_index(self._current_output_index, self._output_devices)
+            ep_id = entry.get("endpoint_id") if entry else None
+        if not ep_id:
+            if self._ptt_attached_ep_id is not None:
+                self.engine.send("ptt_detach")
+                self._ptt_attached_ep_id = None
+            self.ptt_status_var.set("No endpoint ID - pick the WASAPI copy of the target device")
+            self.overlay.set_ptt_muted(True)
+            return
+        if ep_id == self._ptt_attached_ep_id:
+            return
+        self._ptt_attached_ep_id = ep_id
+        self.overlay.set_ptt_muted(True)  # starts muted until attach confirms / a key is held
+        self.engine.send("ptt_attach", ep_id, cb=self._on_ptt_attach)
+
+    def _on_ptt_attach(self, ok, _payload=None):
+        if not self.ptt_enabled_var.get():
+            return
+        self.ptt_status_var.set("MUTED" if ok else "Attach failed")
+        self.overlay.set_ptt_muted(True)
 
     def _on_overlay_enabled_toggle(self):
         if self.overlay_enabled_var.get() and self.running:
             self.overlay.show()
         else:
             self.overlay.hide()
-        self._save()
+        self._schedule_save()
 
     def _on_overlay_position_changed(self):
         self.overlay.set_position(self.overlay_position_var.get())
-        self._save()
+        self._schedule_save()
 
     def _on_overlay_offset_changed(self):
         x = self._int_var_value_min0(self.overlay_offset_x_var, DEFAULT_OVERLAY_OFFSET)
@@ -1297,30 +1835,53 @@ class SwitcherApp(tk.Tk):
         self._save_after_id = None
         self._save()
 
-    def _on_overlay_color_clicked(self, slot):
-        var = self.overlay_color_a_var if slot == "A" else self.overlay_color_b_var
-        button = self.overlay_color_a_button if slot == "A" else self.overlay_color_b_button
+    def _on_overlay_color_clicked(self, slot, mode):
+        var_map = {
+            ("A", "muted"): self.overlay_color_a_muted_var, ("A", "live"): self.overlay_color_a_live_var,
+            ("B", "muted"): self.overlay_color_b_muted_var, ("B", "live"): self.overlay_color_b_live_var,
+        }
+        button_map = {
+            ("A", "muted"): self.overlay_color_a_muted_button, ("A", "live"): self.overlay_color_a_live_button,
+            ("B", "muted"): self.overlay_color_b_muted_button, ("B", "live"): self.overlay_color_b_live_button,
+        }
+        var = var_map[(slot, mode)]
+        button = button_map[(slot, mode)]
         _rgb, hex_color = colorchooser.askcolor(
-            color=var.get(), title=f"Source {slot} overlay color"
+            color=var.get(), title=f"Source {slot} {mode} overlay color"
         )
         if hex_color is None:
             return
         var.set(hex_color)
         button.config(bg=hex_color)
-        self.overlay.set_color(slot, hex_color)
-        self._save()
+        self.overlay.set_color(slot, mode, hex_color)
+        self._schedule_save()
 
     def _on_input_label(self, label):
         if not label:
+            return
+        if self.ptt_capturing:
+            self.ptt_capturing = False
+            self.ptt_add_button.config(text="+ Add Key", bg="SystemButtonFace", state="normal")
+            if label not in self.ptt.keybinds:
+                self.ptt.keybinds.append(label)
+                self._rebuild_ptt_binds()
+                self._schedule_save()
+            self._sync_input_hook()
             return
         if self.capturing:
             self.capturing = False
             self.hotkey_button.config(text="Set Toggle Hotkey...", bg="SystemButtonFace", state="normal")
             self.toggle_hotkey = label
             self.hotkey_var.set(f"Toggle hotkey: {disp(label)}")
-            self._save()
+            self._schedule_save()
+            self._sync_input_hook()
             return
-        if self.toggle_hotkey and label == self.toggle_hotkey and self.running:
+        if (
+            self.hotkey_enabled_var.get()
+            and self.toggle_hotkey
+            and label == self.toggle_hotkey
+            and self.running
+        ):
             self.engine.send("toggle")
 
     def _toggle_source(self):
@@ -1352,10 +1913,18 @@ class SwitcherApp(tk.Tk):
             "hotkey_enabled": self.hotkey_enabled_var.get(),
             "overlay_enabled": self.overlay_enabled_var.get(),
             "overlay_position": self.overlay_position_var.get(),
-            "overlay_color_a": self.overlay_color_a_var.get(),
-            "overlay_color_b": self.overlay_color_b_var.get(),
+            "overlay_color_a_muted": self.overlay_color_a_muted_var.get(),
+            "overlay_color_a_live": self.overlay_color_a_live_var.get(),
+            "overlay_color_b_muted": self.overlay_color_b_muted_var.get(),
+            "overlay_color_b_live": self.overlay_color_b_live_var.get(),
             "overlay_offset_x": self._int_var_value_min0(self.overlay_offset_x_var, DEFAULT_OVERLAY_OFFSET),
             "overlay_offset_y": self._int_var_value_min0(self.overlay_offset_y_var, DEFAULT_OVERLAY_OFFSET),
+            "ptt_enabled": self.ptt_enabled_var.get(),
+            "ptt_keybinds": list(self.ptt.keybinds),
+            "ptt_delay_ms": self.ptt.delay_ms,
+            "ptt_target_ep_id": self._current_ptt_ep_id,
+            "ptt_search": self.ptt_ctrl["search_var"].get(),
+            "was_running": self.running,
         }
         save_prefs(data)
         self.prefs = data
